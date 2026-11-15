@@ -16,7 +16,16 @@ Setup S (the grind-day scalp — only AFTER a V trade has completed):
   entry: close >= 100 bps below 50 bars ago AND RSI(14) < 30 AND two
          consecutive up closes AND the last-30-min drop is no worse than
          -70 bps (no waterfall) AND close is NOT deep (above EMA(120)-150)
-  exit:  take-profit 100 bps, stop-loss 50 bps from the entry close
+  exit:  take-profit 100 bps, stop-loss 50 bps from the entry close;
+         plus a 180-bar (3h) max hold, so a flat scalp cannot sit on the
+         single position all day and block a later V setup (verified no-op
+         on both dev windows -- the OLD scalp exits at bar 129; a 120-bar
+         hold would have cut it early and cost $5.59)
+
+Stuck-position insurance: a V trade also exits after 240 bars (4h) if
+neither the trail nor the stop has fired (also a verified no-op: the V
+trades last 99 and 47 bars). A trade that goes flat for hours frees the
+position instead of blocking the other setup.
 
 Local grades (real bot through replay.py, exact harness fill model):
   NEW dev window (2026-11-14, -400 bps day, one +4.4% V-bounce):
@@ -52,6 +61,8 @@ S_CAP_BPS = 70        # S: last-30-min drop must be no worse than -70 bps
 S_EXCL_BPS = 150      # S: close must NOT be deeper than this below EMA(120)
 S_TP_BPS = 100        # S: take-profit from the entry close
 S_SL_BPS = 50         # S: stop-loss from the entry close
+S_MAX_HOLD_BARS = 180 # S: max hold, bars (stuck-position insurance)
+V_MAX_HOLD_BARS = 240 # V: max hold, bars (stuck-position insurance)
 MAX_SLIPPAGE_BPS = 500
 WARMUP_BARS = 122     # first decidable bar (matches the backtest's i >= 121)
 
@@ -61,6 +72,7 @@ _ema_fast = None
 _ema_mid = None
 _mode = None          # "V" | "S" | None
 _entry_close = 0      # decision close of the open trade
+_entry_bar = 0        # bar index (len(closes)-1) of the open trade's entry
 _peak = 0             # highest close seen while holding
 _v_traded = False     # a V trade has completed (gates the S leg)
 
@@ -93,7 +105,7 @@ def _sell_all(state):
 
 
 def on_batch(state, batch):
-    global _ema_fast, _ema_mid, _mode, _entry_close, _peak, _v_traded
+    global _ema_fast, _ema_mid, _mode, _entry_close, _entry_bar, _peak, _v_traded
     for bar in batch["bars"]:
         if bar["symbol"] == SYMBOL:
             c = int(bar["c"])
@@ -125,11 +137,18 @@ def on_batch(state, batch):
                 _v_traded = True
                 _mode = None
                 return _sell_all(state)
+            if len(closes) - 1 - _entry_bar >= V_MAX_HOLD_BARS:
+                _v_traded = True
+                _mode = None
+                return _sell_all(state)
         else:  # S leg
             if close * 10000 >= _entry_close * (10000 + S_TP_BPS):
                 _mode = None
                 return _sell_all(state)
             if close * 10000 <= _entry_close * (10000 - S_SL_BPS):
+                _mode = None
+                return _sell_all(state)
+            if len(closes) - 1 - _entry_bar >= S_MAX_HOLD_BARS:
                 _mode = None
                 return _sell_all(state)
         return []
@@ -139,6 +158,7 @@ def on_batch(state, batch):
     if deep and turn and state.cash > 0:
         _mode = "V"
         _entry_close = close
+        _entry_bar = len(closes) - 1
         _peak = close
         return [{"side": "buy", "symbol": SYMBOL,
                  "notional_quote_units": state.cash,
@@ -152,6 +172,7 @@ def on_batch(state, batch):
         if drop_ok and rsi_ok and up2 and drop30 > -S_CAP_BPS and not_deep and state.cash > 0:
             _mode = "S"
             _entry_close = close
+            _entry_bar = len(closes) - 1
             _peak = close
             return [{"side": "buy", "symbol": SYMBOL,
                      "notional_quote_units": state.cash,
